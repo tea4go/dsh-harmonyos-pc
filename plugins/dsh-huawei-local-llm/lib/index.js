@@ -360,12 +360,18 @@ function defaultProviderModels() {
  */
 function buildPiAdapter(config) {
   const baseURL = `${currentOrigin()}/v1`;
-  const source = Config({ providers: { [PROVIDER_ID]: {
+  const providers = Config({ providers: { [PROVIDER_ID]: {
     displayName: PROVIDER_DISPLAY,
     api: "openai-completions",
     baseURL,
     models: config.models ?? defaultProviderModels()
-  } } }).providers[PROVIDER_ID];
+  } } }).providers;
+  // dsh 0.2.x 起 llm-pi-ai 的 Config.providers 由普通对象改成 dict 集合；注意该集合的
+  // get() 返回的是「整个 provider 字典」(传 id 也一样)，所以先取字典再按 id 取条目。
+  // 0.1.x 仍是普通对象，两种形状都兼容。
+  const dict = typeof providers?.get === "function" ? providers.get() : providers;
+  const source = dict instanceof Map ? dict.get(PROVIDER_ID) : dict?.[PROVIDER_ID];
+  if (!source) throw new Error(`llm-pi-ai 未解析出 provider "${PROVIDER_ID}" 的 profile`);
   const models = source.models.map((m) => ({
     id: m.id,
     name: m.name ?? m.id,

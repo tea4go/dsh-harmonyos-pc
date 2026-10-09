@@ -10,7 +10,8 @@ import { homedir } from 'node:os';
 
 const VERSION = process.argv[2];
 if (!VERSION) { console.error('用法: node dsh-manual-install.mjs <版本>'); process.exit(1); }
-const NM = join(homedir(), 'dsh-test', 'node_modules');
+// 目标 node_modules：默认 ~/dsh-test，可用 DSH_NODE_MODULES 指向隔离目录做探针安装。
+const NM = process.env.DSH_NODE_MODULES || join(homedir(), 'dsh-test', 'node_modules');
 const REG = 'https://registry.npmjs.org';
 const UA = 'manual-dsh-installer';
 const TIMEOUT_MS = 60000;
@@ -32,6 +33,23 @@ const numsOf = (v) => {
 };
 // 比较 [maj,min,pa,stage,pre]
 function cmpNums(a, b) { for (let i = 0; i < 5; i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1; return 0; }
+// npm 语义的范围判定：^ 在 0.x 上锁定次版本、0.0.x 上锁定补丁版本。
+// 直装器旧实现只比较主版本，导致 ^0.1.6 被误判满足 0.2.x，跨 0.1↔0.2 的升级/回滚全部失效。
+function rangeAllows(r, q) {
+  if (!r || !q) return false;
+  if (r.kind === 'unknown') return true;
+  if (!r.nums) return false;
+  const R = r.nums;
+  if (cmpNums(q, R) < 0) return false;
+  if (r.kind === 'exact') return cmpNums(q, R) === 0;
+  if (r.kind === '~') return q[0] === R[0] && q[1] === R[1];
+  if (r.kind === '^') {
+    if (R[0] !== 0) return q[0] === R[0];
+    if (R[1] !== 0) return q[0] === 0 && q[1] === R[1];
+    return q[0] === 0 && q[1] === 0 && q[2] === R[2];
+  }
+  return true;
+}
 // 解析 range：支持 精确 / ^x.y.z[-alpha|rc.n] / ~x.y.z[-alpha|rc.n] / ^4 / ~4.1 等简写；
 // 无法解析的（>=、||、@^4 等）标为 unknown → 已装有则不重装，缺失则装最高版本。
 function parseRange(spec) {
@@ -53,12 +71,8 @@ function pickVersion(m, spec) {
   for (const v of Object.keys(m.versions)) {
     const q = numsOf(v);
     if (!q) continue;
-    if (r.kind === '^' && q[0] !== r.nums[0]) continue;
-    if (r.kind === '~' && (q[0] !== r.nums[0] || q[1] !== r.nums[1])) continue;
-    if (r.kind === 'exact') { if (cmpNums(q, r.nums) === 0) return v; continue; }
-    if (r.kind === '^' || r.kind === '~') {
-      if (cmpNums(q, r.nums) < 0) continue;
-    }
+    if (!rangeAllows(r, q)) continue;
+    if (r.kind === 'exact') return v;
     if (!best || cmpNums(q, best.q) > 0) best = { v, q };
   }
   return best ? best.v : null;
@@ -176,10 +190,6 @@ function satisfies(cur, spec) {
   const r = parseRange(spec);
   const c = numsOf(cur);
   if (!r || !c) return false;
-  if (r.kind === 'unknown') return true;
-  if (r.kind === 'exact') return cmpNums(c, r.nums) === 0;
-  if (r.kind === '^' && c[0] !== r.nums[0]) return false;
-  if (r.kind === '~' && (c[0] !== r.nums[0] || c[1] !== r.nums[1])) return false;
-  return cmpNums(c, r.nums) >= 0;
+  return rangeAllows(r, c);
 }
 main().then(() => process.exit(0)).catch((e) => { console.error('✗ ' + e.message); process.exit(1); });

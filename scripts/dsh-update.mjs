@@ -8,7 +8,8 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 const HOME = homedir();
-const DSH_DIR = join(HOME, 'dsh-test');
+// 目标安装目录：默认 ~/dsh-test，可用 DSH_DIR 指向隔离探针目录做干跑。
+const DSH_DIR = process.env.DSH_DIR || join(HOME, 'dsh-test');
 const PKG = join(DSH_DIR, 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
 const WEB_SH = join(HOME, 'bin', 'dsh-web.sh');
 const LOG = join(HOME, 'dsh-update.log');
@@ -48,6 +49,13 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // 本仓库 scripts/ 下为权威副本，patch/install 时自动同步进 dsh-test 并改写 worker 引用。
 const LOADER_MJS = join(__dirname, 'compat-loader.mjs');
 const LOADER_CJS = join(__dirname, 'compat-loader-cjs.cjs');
+// 0.2.x settings 兼容垫片源码（patchSettingsCompat 直接内联进 dsh-settings）。
+const SETTINGS_COMPAT_FILE = join(__dirname, 'dsh-settings-compat.mjs');
+// 0.2.1 起 dsh-app-boot 用 node-addon-require-builtin 走 C++ addon 取 node 内部模块；
+// 鸿蒙无 openharmony-arm64 预编译件、也无编译器 → 换成 --expose-internals 下的纯 JS 复刻。
+const REQUIRE_BUILTIN_FILE = join(DSH_DIR, 'node_modules', 'node-addon-require-builtin', 'lib', 'index.js');
+// 0.2.x typert 校验要求 codec 带 create() 工厂；社区插件手写清单仍是 0.1.x 的 {mode,typeSymbol,schema}。
+const TYPERT_LOADER_FILE = join(DSH_DIR, 'node_modules', '@deepseek-ai', 'dsh-typert-loader', 'lib', 'index.js');
 const DSH_LOADER_MJS = join(DSH_DIR, 'compat-loader.mjs');
 const DSH_LOADER_CJS = join(DSH_DIR, 'compat-loader-cjs.cjs');
 const WORKER_CJS_FILE = join(DSH_DIR, 'node_modules', '@deepseek-ai', 'dsh-session-persistence-jsonl', 'lib', 'worker.cjs');
@@ -393,6 +401,19 @@ function patchSettingsCompat() {
   const txt = readFileSafe(SETTINGS_FILE);
   if (!txt) throw new Error('dsh-settings 文件不存在，需手动处理: ' + SETTINGS_FILE);
   if (txt.includes(MARK)) return { changed: false };
+  // 0.2.x：SettingsProvider → SettingsForms（configEditor 自动分区），旧导出整体移除。
+  // 这里把自包含的旧命名空间存储垫片内联进模块，并补回旧导出。
+  const mFsAnchor = 'import { existsSync } from "node:fs";';
+  const mExportAnchor = 'export { SettingsConflictError, SettingsForms, SettingsForms as default, redactSecrets };';
+  if (txt.includes(mFsAnchor) && txt.includes(mExportAnchor)) {
+    const shim = readFileSafe(SETTINGS_COMPAT_FILE);
+    if (!shim) throw new Error('settings 兼容垫片缺失: ' + SETTINGS_COMPAT_FILE);
+    let modernTxt = txt
+      .replace(mFsAnchor, 'import { existsSync, readFileSync, writeFileSync } from "node:fs";')
+      .replace(mExportAnchor, '\n' + shim.trim() + '\nexport { SettingsConflictError, SettingsForms, SettingsForms as default, redactSecrets, settingsNamespace, installSettingsSection, hxDeepEqualJson as deepEqualJson };');
+    writeFileSync(SETTINGS_FILE, modernTxt);
+    return { changed: true };
+  }
   const anchor = 'export { SettingsConflictError, SettingsProvider, SettingsProvider as default, redactSecrets };';
   if (!txt.includes(anchor)) throw new Error('dsh-settings 补丁锚点缺失(export 行)，需手动处理: ' + SETTINGS_FILE);
   const block =
@@ -422,9 +443,18 @@ function patchLoopbackAuth() {
   if (!txt) throw new Error('dsh-client-connection 文件不存在，需手动处理: ' + CONN_FILE);
   if (txt.includes(MARK)) return { changed: false };
   const helperAnchor = 'function tokenMatches(actual, expected) {\n\tconst actualBytes = Buffer.from(actual, "utf8");\n\tconst expectedBytes = Buffer.from(expected, "utf8");\n\treturn actualBytes.byteLength === expectedBytes.byteLength && timingSafeEqual(actualBytes, expectedBytes);\n}';
-  const inlineMint = '\t\t\t\tconst issuedAt = Date.now();\n\t\t\t\tconst expiresAt = issuedAt + this.maxAgeMilliseconds;\n\t\t\t\tconst value = encodeCookie({\n\t\t\t\t\tversion: COOKIE_PAYLOAD_VERSION,\n\t\t\t\t\tauthority,\n\t\t\t\t\tissuedAt,\n\t\t\t\t\texpiresAt\n\t\t\t\t}, this.secret);\n\t\t\t\tres.writeHead(303, {\n\t\t\t\t\t"cache-control": "no-store",\n\t\t\t\t\t"location": "/",\n\t\t\t\t\t"referrer-policy": "no-referrer",\n\t\t\t\t\t"set-cookie": sessionCookie(cookieName(authority), value, expiresAt, Math.floor(this.maxAgeMilliseconds / 1e3))\n\t\t\t\t});\n\t\t\t\tres.end();\n\t\t\t\treturn false;\n\t\t\t}';
-  const tokensTailAnchor = '\t\t\tthis.writeUnauthorized(req, res);\n\t\t\treturn false;\n\t\t}\n\t\tif (this.isAuthenticated(req)) return true;';
-  const noTokenTailAnchor = '\t\tif (this.isAuthenticated(req)) return true;\n\t\tthis.writeUnauthorized(req, res);\n\t\treturn false;\n\t}';
+  // 上游 0.2.1 起把 303 跳转从 "/" 改成 "./"（相对当前路径），锚点随之自适应。
+  const redirectLocation = txt.includes('\t\t\t\t\t"location": "/",') ? '"location": "/"' : txt.includes('\t\t\t\t\t"location": "./",') ? '"location": "./"' : null;
+  if (redirectLocation === null) throw new Error('client-connection 补丁锚点缺失(location 行)，需手动处理: ' + CONN_FILE);
+  // 上游 0.2.1-alpha.2 起 authorizeIndex/isAuthenticated/sessionCookie 增加 secure 参数(https 下发 Secure
+  // cookie)，requestAuthority 改名 requestAudience(headers, secure)。按文件形状自适应：alpha.1 走旧锚点/
+  // 旧调用，alpha.2 起补 secure 并换受众函数，同一份补丁两边都能打。
+  const secure = txt.includes('requestAudience(') || txt.includes('isAuthenticated(request, secure = false)');
+  const secArg = secure ? ', secure' : '';
+  const audienceExpr = secure ? 'requestAudience(req.headers, secure)' : 'requestAuthority(req.headers)';
+  const inlineMint = '\t\t\t\tconst issuedAt = Date.now();\n\t\t\t\tconst expiresAt = issuedAt + this.maxAgeMilliseconds;\n\t\t\t\tconst value = encodeCookie({\n\t\t\t\t\tversion: COOKIE_PAYLOAD_VERSION,\n\t\t\t\t\tauthority,\n\t\t\t\t\tissuedAt,\n\t\t\t\t\texpiresAt\n\t\t\t\t}, this.secret);\n\t\t\t\tres.writeHead(303, {\n\t\t\t\t\t"cache-control": "no-store",\n\t\t\t\t\t' + redirectLocation + ',\n\t\t\t\t\t"referrer-policy": "no-referrer",\n\t\t\t\t\t"set-cookie": sessionCookie(cookieName(authority), value, expiresAt, Math.floor(this.maxAgeMilliseconds / 1e3)' + secArg + ')\n\t\t\t\t});\n\t\t\t\tres.end();\n\t\t\t\treturn false;\n\t\t\t}';
+  const tokensTailAnchor = '\t\t\tthis.writeUnauthorized(req, res);\n\t\t\treturn false;\n\t\t}\n\t\tif (this.isAuthenticated(req' + secArg + ')) return true;';
+  const noTokenTailAnchor = '\t\tif (this.isAuthenticated(req' + secArg + ')) return true;\n\t\tthis.writeUnauthorized(req, res);\n\t\treturn false;\n\t}';
   for (const [name, anchor] of [['helper', helperAnchor], ['inlineMint', inlineMint], ['tokensTail', tokensTailAnchor], ['noTokenTail', noTokenTailAnchor]]) {
     if (!txt.includes(anchor)) throw new Error('client-connection 补丁锚点缺失(' + name + ')，需手动处理: ' + CONN_FILE);
   }
@@ -442,25 +472,25 @@ function patchLoopbackAuth() {
     '\t}\n' +
     '\treturn host === "localhost" || host === "::1" || host === "0:0:0:0:0:0:0:1" || host.startsWith("127.");\n' +
     '}';
-  const mintCall = '\t\t\t\tthis.mintCookie(req, res, authority);\n\t\t\t\treturn false;\n\t\t\t}';
+  const mintCall = '\t\t\t\tthis.mintCookie(req, res, authority' + secArg + ');\n\t\t\t\treturn false;\n\t\t\t}';
   const staleFallback =
     '\t\t\t/* HarmonyOS patch: 回环地址兜底——旧进程的过期 token(浏览器里残留的旧 URL)\n' +
     '\t\t\t * 直接换新 cookie，避免「authentication required」死锁；非回环仍 401。 */\n' +
-    '\t\t\tif (this.loopbackSession(req)) {\n' +
-    '\t\t\t\tthis.mintCookie(req, res, requestAuthority(req.headers));\n' +
+    '\t\t\tif (this.loopbackSession(req' + secArg + ')) {\n' +
+    '\t\t\t\tthis.mintCookie(req, res, authority' + secArg + ');\n' +
     '\t\t\t\treturn false;\n' +
     '\t\t\t}\n';
   const noTokenFallback =
     '\t\t/* HarmonyOS patch: 单用户本机(127.0.0.1/localhost)直接访问 / 无需 token，自动签发\n' +
     '\t\t * 30 天 cookie(与 token 交换同一签名密钥/绑定 authority)，随后刷新即可持续登录。\n' +
     '\t\t * 仅在 cookie 无效时兜底，避免有效会话被 303 循环；非回环地址仍走原 token 流程。 */\n' +
-    '\t\tif (this.loopbackSession(req)) {\n' +
-    '\t\t\tthis.mintCookie(req, res, requestAuthority(req.headers));\n' +
+    '\t\tif (this.loopbackSession(req' + secArg + ')) {\n' +
+    '\t\t\tthis.mintCookie(req, res, ' + audienceExpr + secArg + ');\n' +
     '\t\t\treturn false;\n' +
     '\t\t}\n';
   const methods =
     '\t/** Mint the authority-bound 30-day session cookie and redirect to clean `/` (HarmonyOS patch). */\n' +
-    '\tmintCookie(req, res, authority) {\n' +
+    '\tmintCookie(req, res, authority, secure = false) {\n' +
     '\t\tconst issuedAt = Date.now();\n' +
     '\t\tconst expiresAt = issuedAt + this.maxAgeMilliseconds;\n' +
     '\t\tconst value = encodeCookie({\n' +
@@ -473,13 +503,13 @@ function patchLoopbackAuth() {
     '\t\t\t"cache-control": "no-store",\n' +
     '\t\t\t"location": "/",\n' +
     '\t\t\t"referrer-policy": "no-referrer",\n' +
-    '\t\t\t"set-cookie": sessionCookie(cookieName(authority), value, expiresAt, Math.floor(this.maxAgeMilliseconds / 1e3))\n' +
+    '\t\t\t"set-cookie": sessionCookie(cookieName(authority), value, expiresAt, Math.floor(this.maxAgeMilliseconds / 1e3)' + secArg + ')\n' +
     '\t\t});\n' +
     '\t\tres.end();\n' +
     '\t}\n' +
     '\t/** True for a GET index request from a trusted loopback authority (HarmonyOS patch). */\n' +
-    '\tloopbackSession(req) {\n' +
-    '\t\tconst authority = requestAuthority(req.headers);\n' +
+    '\tloopbackSession(req, secure = false) {\n' +
+    '\t\tconst authority = ' + audienceExpr + ';\n' +
     '\t\tif (req.method !== "GET" || authority === void 0 || !isLoopbackAuthority(authority)) return false;\n' +
     '\t\tconst url = new URL(req.url ?? "/", "http://dsh.invalid");\n' +
     '\t\treturn url.pathname === "/";\n' +
@@ -488,42 +518,50 @@ function patchLoopbackAuth() {
     .split(helperAnchor).join(helperAnchor + helper)
     .split(inlineMint).join(mintCall)
     .split(tokensTailAnchor).join(staleFallback + tokensTailAnchor)
-    .split(noTokenTailAnchor).join('\t\tif (this.isAuthenticated(req)) return true;\n' + noTokenFallback + '\t\tthis.writeUnauthorized(req, res);\n\t\treturn false;\n\t}\n' + methods);
+    .split(noTokenTailAnchor).join('\t\tif (this.isAuthenticated(req' + secArg + ')) return true;\n' + noTokenFallback + '\t\tthis.writeUnauthorized(req, res);\n\t\treturn false;\n\t}\n' + methods);
   writeFileSync(CONN_FILE, patched);
   return { changed: true };
 }
+// 0.2.1 起 bin.js 不再 import node:url，"改 import 行" 的旧锚点会静默失配：
+// 垫片内的 try/catch 会吞掉 ReferenceError → isMainEntry 恒 false → 入口静默退出码 0。
+// 改为自包含的动态 import 判等垫片；先剥掉旧块再统一插入，保证幂等/可重打。
 function patchImportMetaMain() {
+  const HELPER =
+    '/* HarmonyOS patch: node v22.7.0 无 import.meta.main(官方基线 ≥22.18)，入口静默退出；\n' +
+    ' * 动态 import node:url/node:path 做 argv[1]+metaUrl 等价判等(不依赖文件顶部 import 形状)。 */\n' +
+    'const __hxUrl = await import("node:url");\n' +
+    'const __hxPath = await import("node:path");\n' +
+    'function isMainEntry(argv1, metaUrl) {\n' +
+    '\tif (typeof argv1 !== "string") return false;\n' +
+    '\ttry { return __hxUrl.pathToFileURL(__hxPath.resolve(argv1)).href === metaUrl; } catch { return false; }\n' +
+    '}';
+  const oldHelperRe = /\n\/\* HarmonyOS patch: node v22\.7\.0[\s\S]*?\n\}\n/;
   const edits = [
     {
       file: BIN_FILE,
-      importAnchor: 'import { fileURLToPath } from "node:url";',
-      importReplacement: 'import { fileURLToPath, pathToFileURL } from "node:url";\nimport { resolve } from "node:path";',
-      runAnchor: 'if (import.meta.main) await runCli();',
-      block: '/* HarmonyOS patch: node v22.7.0 无 import.meta.main(官方基线 ≥22.18)，入口静默退出；改回 argv[1]+metaUrl 等价判等。 */\nfunction isMainEntry(argv1, metaUrl) {\n\tif (typeof argv1 !== "string") return false;\n\ttry { return pathToFileURL(resolve(argv1)).href === metaUrl; } catch { return false; }\n}\nif (isMainEntry(process.argv[1], import.meta.url)) await runCli();'
+      original: 'if (import.meta.main) await runCli();',
+      patched: 'if (isMainEntry(process.argv[1], import.meta.url)) await runCli();',
+      entry: 'if (import.meta.main ?? isMainEntry(process.argv[1], import.meta.url)) await runCli();'
     },
     {
       file: RUNNER_FILE,
-      importAnchor: 'import { closeSync } from "node:fs";',
-      importReplacement: 'import { closeSync } from "node:fs";\nimport { pathToFileURL } from "node:url";\nimport { resolve } from "node:path";',
-      runAnchor: 'if (import.meta.main) {',
-      block: '/* HarmonyOS patch: node v22.7.0 无 import.meta.main(官方基线 ≥22.18)，子进程 runner 入口需等价判等。 */\nfunction isMainEntry(argv1, metaUrl) {\n\tif (typeof argv1 !== "string") return false;\n\ttry { return pathToFileURL(resolve(argv1)).href === metaUrl; } catch { return false; }\n}\nif (isMainEntry(process.argv[1], import.meta.url)) {'
+      original: 'if (import.meta.main) {',
+      patched: 'if (isMainEntry(process.argv[1], import.meta.url)) {',
+      entry: 'if (import.meta.main ?? isMainEntry(process.argv[1], import.meta.url)) {'
     }
   ];
   let changedCount = 0;
   for (const e of edits) {
-    const txt = readFileSafe(e.file);
-    if (!txt) throw new Error('入口文件不存在，需手动处理: ' + e.file);
-    if (txt.includes(MARK)) continue;
-    let next = txt;
-    if (e.importAnchor && next.includes(e.importAnchor)) next = next.split(e.importAnchor).join(e.importReplacement);
-    if (!next.includes(e.runAnchor)) throw new Error('入口判等锚点缺失(import.meta.main)，需手动处理: ' + e.file);
-    next = next.split(e.runAnchor).join(e.block);
-    writeFileSync(e.file, next);
-    changedCount += 1;
+    const before = readFileSafe(e.file);
+    if (!before) throw new Error('入口文件不存在，需手动处理: ' + e.file);
+    let next = before.replace(oldHelperRe, '\n');
+    const found = [e.original, e.patched, e.entry].find((c) => next.includes(c));
+    if (found === void 0) throw new Error('入口判等锚点缺失(import.meta.main)，需手动处理: ' + e.file);
+    next = next.split(found).join(HELPER + '\n' + e.entry);
+    if (next !== before) { writeFileSync(e.file, next); changedCount += 1; }
   }
   return { changed: changedCount > 0 };
 }
-// 把仓库权威 compat-loader 同步进 dsh-test（ESM polyfill + CJS worker 孪生）。
 function syncCompatLoaders() {
   let changed = 0;
   for (const [repo, target] of [[LOADER_MJS, DSH_LOADER_MJS], [LOADER_CJS, DSH_LOADER_CJS]]) {
@@ -653,19 +691,75 @@ function patchMessagesSkipNonText() {
   return { changed: true };
 }
 
+// 0.2.1 新增依赖 node-addon-require-builtin（dsh/dsh-app-boot/dsh-hmr 取内部模块用）。
+// 它的 native loader 需要一个 openharmony-arm64 预编译 addon；本机没有也编不出（无工具链），
+// boot 时会 fatal "No usable native binding found"。可用 --expose-internals 下 require("internal/…")
+// 等价取到同样的内部模块（实测 loader/cjs/helpers/esm-utils/esm-resolve 全可用），改写成纯 JS。
+function patchRequireBuiltinAddon() {
+  const txt = readFileSafe(REQUIRE_BUILTIN_FILE);
+  if (!txt) return { changed: false }; // 上游未引入该依赖：无需处理
+  if (txt.includes(MARK)) return { changed: false };
+  const shim = [
+    '"use strict";',
+    '/* HarmonyOS patch: 无 openharmony-arm64 原生件，改用 --expose-internals 的 require("internal/...") 复刻。 */',
+    'Object.defineProperty(exports, "__esModule", { value: true });',
+    'function requireBuiltin(moduleId) {',
+    '  return require(moduleId);',
+    '}',
+    'function isAllowedInternalId(moduleId) {',
+    '  return typeof moduleId === "string" && moduleId.startsWith("internal/");',
+    '}',
+    'function getBindingInfo() {',
+    '  return { package: "node-addon-require-builtin", backend: "js-internals", abi: null, loaded: true };',
+    '}',
+    'exports.requireBuiltin = requireBuiltin;',
+    'exports.isAllowedInternalId = isAllowedInternalId;',
+    'exports.getBindingInfo = getBindingInfo;',
+    'exports.default = { requireBuiltin, isAllowedInternalId, getBindingInfo };',
+    ''
+  ].join('\n');
+  writeFileSync(REQUIRE_BUILTIN_FILE, shim);
+  return { changed: true };
+}
+
+// dsh 0.2.x 的 typert-loader 要求 invocation codec 形如 {mode:"strict", typeSymbol, create()}；
+// 社区插件（cost-meter/knowledge-base/session-groups/doc-quick/peak-valley/workstation）手写清单
+// 仍是 0.1.x 生成器的 {mode:"strict", typeSymbol, schema}。就地补 create() = () => schema，
+// 让 decode() 里的 codec.create().parse(value) 走通，不必改各插件源码。
+function patchTypertCodecCompat() {
+  const txt = readFileSafe(TYPERT_LOADER_FILE);
+  if (!txt) return { changed: false };
+  if (txt.includes(MARK + ': typert codec')) return { changed: false };
+  const anchor = 'if (typeof codec.create !== "function") throw new Error(`typert-loader: ${pkgName} ${subject} has no create() factory`);';
+  if (!txt.includes(anchor)) throw new Error('typert-loader 补丁锚点缺失(create 工厂)，需手动处理: ' + TYPERT_LOADER_FILE);
+  const inject =
+    '/* ' + MARK + ': typert codec —— 0.1.x 清单写 {mode,typeSymbol,schema}，0.2.x 改要 create() 工厂；就地从 schema 补。 */\n' +
+    '\tif (typeof codec.create !== "function" && codec.schema !== void 0) codec.create = () => codec.schema;\n';
+  writeFileSync(TYPERT_LOADER_FILE, txt.split(anchor).join(inject + anchor));
+  return { changed: true };
+}
+
 function patchAll() {
   const l = syncCompatLoaders();
   const r1 = patchCredentials(), r2 = patchSession(), r3 = patchPermission(), r4 = patchAttachment(), r5 = patchVision();
   const r6 = patchCordisLoader(), r7 = patchSettingsCompat(), r8 = patchLoopbackAuth(), r9 = patchFsLocal(), r10 = patchImportMetaMain(), r11 = patchWorkerZlib(), r12 = patchSessionVerify(), r13 = patchSessionFormat(), r14 = patchMigrationPublish();
   const r15 = patchLegacySubagentIdentity();
   const r16 = patchMessagesSkipNonText();
+  const r17 = patchRequireBuiltinAddon();
+  const r18 = patchTypertCodecCompat();
   for (const f of [CRED_FILE, SESS_FILE, PERM_FILE, ATTACH_FILE, VISUAL_FILE, CORDIS_LOADER_FILE, SETTINGS_FILE, CONN_FILE, BIN_FILE, RUNNER_FILE, WORKER_CJS_FILE, SESSION_FORMAT_FILE, SUBAGENT_FILE, MESSAGES_FILE]) {
     if (!readFileSafe(f).includes(MARK)) throw new Error('补丁校验失败(标记缺失): ' + f);
+  }
+  if (readFileSafe(TYPERT_LOADER_FILE) && !readFileSafe(TYPERT_LOADER_FILE).includes(MARK + ': typert codec')) {
+    throw new Error('补丁校验失败(标记缺失): ' + TYPERT_LOADER_FILE);
+  }
+  if (readFileSafe(REQUIRE_BUILTIN_FILE) && !readFileSafe(REQUIRE_BUILTIN_FILE).includes(MARK)) {
+    throw new Error('补丁校验失败(标记缺失): ' + REQUIRE_BUILTIN_FILE);
   }
   if (!readFileSafe(FS_LOCAL_FILE).includes('HarmonyOS /storage mounts reject hard links')) {
     throw new Error('补丁校验失败(标记缺失): ' + FS_LOCAL_FILE);
   }
-  return { loaders: l.changed, credential: r1.changed, session: r2.changed, permission: r3.changed, attachment: r4.changed, vision: r5.changed, cordisLoader: r6.changed, settingsCompat: r7.changed, loopbackAuth: r8.changed, fsLocal: r9.changed, importMetaMain: r10.changed, workerZlib: r11.changed, sessionVerify: r12.changed, sessionFormat: r13.changed, migrationPublish: r14.changed, subagentIdentity: r15.changed, messagesSkipNonText: r16.changed };
+  return { loaders: l.changed, credential: r1.changed, session: r2.changed, permission: r3.changed, attachment: r4.changed, vision: r5.changed, cordisLoader: r6.changed, settingsCompat: r7.changed, loopbackAuth: r8.changed, fsLocal: r9.changed, importMetaMain: r10.changed, workerZlib: r11.changed, sessionVerify: r12.changed, sessionFormat: r13.changed, migrationPublish: r14.changed, subagentIdentity: r15.changed, messagesSkipNonText: r16.changed, requireBuiltinAddon: r17.changed, typertCodec: r18.changed };
 }
 
 // compat-loader.mjs（node v22 鸿蒙运行时 polyfill）依赖的纯 JS 包。重装核心包时它们不在依赖树里
@@ -724,9 +818,20 @@ function syncPackageJson() {
 }
 
 // ---- 锁 / 重启 ----
+// 陈旧锁自愈：上一次被 SIGKILL/崩溃打断时锁文件会留下来，而写入者早已不在，
+// 不清就会让后续 install/rollback 永久卡在「另一操作进行中」。写入成功仍用 O_EXCL。
 function acquireLock() {
-  try { writeFileSync(LOCK, String(process.pid), { flag: 'wx' }); return true; }
-  catch { return false; }
+  const take = () => { try { writeFileSync(LOCK, String(process.pid), { flag: 'wx' }); return true; } catch { return false; } };
+  if (take()) return true;
+  try {
+    const pid = parseInt(readFileSync(LOCK, 'utf8').trim(), 10);
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
+      let alive = true;
+      try { process.kill(pid, 0); } catch (e) { alive = e && e.code === 'EPERM'; } // EPERM=存在但无权限 ⇒ 仍活着
+      if (!alive) { try { unlinkSync(LOCK); } catch {} return take(); }
+    }
+  } catch {}
+  return false;
 }
 function releaseLock() { try { unlinkSync(LOCK); } catch {} }
 
@@ -807,7 +912,14 @@ async function rollback(version) {
 // ---- 交互 ----
 function ask(q) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((res) => rl.question(q, (a) => { rl.close(); res(a); }));
+  // stdin 到 EOF(^D / </dev/null)时 readline 只发 'close'、question 回调不触发，
+  // 旧实现会让 Promise 悬着 → finally 里的 releaseLock 不执行 → 留下 stale 锁。EOF 当空回答。
+  return new Promise((res) => {
+    let done = false;
+    const finish = (a) => { if (done) return; done = true; rl.close(); res(a); };
+    rl.question(q, finish);
+    rl.on('close', () => finish(''));
+  });
 }
 async function interactive() {
   const c = check();
@@ -821,8 +933,19 @@ async function interactive() {
 
 function die(msg) { console.error('✗ ' + msg); process.exit(1); }
 
+const USAGE = [
+  '用法: node dsh-update.mjs <命令>',
+  '  check              只检查，打印 { installed, latest, upToDate }',
+  '  patch              只重打鸿蒙 node_modules 补丁（幂等）',
+  '  install | update   升级到最新并重打补丁、重启服务',
+  '  rollback [版本]    回滚（默认上一版本）',
+  '  (无参数)           交互式菜单',
+  '环境变量: DSH_DIR 指向隔离安装目录做干跑（默认 ~/dsh-test）'
+].join('\n');
+
 async function main() {
   const cmd = process.argv[2];
+  if (cmd === '-h' || cmd === '--help' || cmd === 'help') { console.log(USAGE); return; }
   if (cmd === 'check') { console.log(JSON.stringify(check(), null, 2)); return; }
   if (cmd === 'patch') { console.log(JSON.stringify(patchAll(), null, 2)); return; }
   if (cmd === 'install' || cmd === 'update') {
@@ -835,6 +958,8 @@ async function main() {
     try { console.log(JSON.stringify(await rollback(process.argv[3]), null, 2)); } finally { releaseLock(); }
     return;
   }
+  // 未知命令：给用法并退出，别静默落进交互式菜单（否则会留下 stale 锁）。
+  if (cmd !== undefined) { console.error(USAGE); process.exitCode = 1; return; }
   if (!acquireLock()) return die('另一操作进行中');
   try { await interactive(); } finally { releaseLock(); }
 }

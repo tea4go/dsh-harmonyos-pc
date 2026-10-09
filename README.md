@@ -454,6 +454,7 @@ node hvigorw.js assembleHap
 | `scripts/dsh-web.sh` | dsh Web 服务启动/重启（3080，幂等探活） |
 | `scripts/dsh-update.mjs` | dsh 检查更新：`check` / `patch` / `install` / `rollback`，升级后自动重打补丁 |
 | `scripts/dsh-manual-install.mjs` | 手动直装器：registry 元数据递归解析 + tarball 直装（绕过 npm arborist 解析卡死），`install()`/`rollback()` 自动调用、npm 兜底 |
+| `scripts/dsh-settings-compat.mjs` | 0.2.x `settings` 兼容垫片源码（由 `dsh-update.mjs` 内联进 `dsh-settings`，补回旧命名空间 API） |
 | `scripts/dsh-update-web.sh` | 设置与更新页（3098，内嵌 HTML） |
 | `scripts/dsh-hm-install.mjs` | GitHub 源插件一键安装（绕过 isogit 拦截） |
 | `scripts/dsh-hm-update.sh` | **一键更新**（官方 dsh 升级 + 仓库预设/插件/补丁同步，`check` / 默认 update） |
@@ -465,8 +466,8 @@ node hvigorw.js assembleHap
 （code-range 预留 mmap 失败 → `Fatal error in , line 0` / `Check failed: 12 == (*__errno_location())`，没有官方开关可关），
 deveco 自带的 v22.7 反而稳定。所以脚本不再写死路径，而是：
 
-1. 把本机能找到的 node 全列出来（`/data/service/hnp/node.org/node_*/bin/node`、`~/deveco/deveco_tools/node/bin/node`、`PATH` 里的、常见目录）——
-   hnp 那批是按 `node_*` 目录扫的，**hnp 哪天把 node 升到 26 也自动跟上，不用改脚本**；
+1. 把本机能找到的 node 全列出来（`/data/service/hnp/node.org/node_*/bin/node`、`/data/service/hnp/hmos-clt.org/*/node/bin/node`、`~/deveco/deveco_tools/node/bin/node`、`PATH` 里的、常见目录）——
+   那两批是按版本目录扫的，**hnp / hmos-clt 哪天把 node 升到 26 也自动跟上，不用改脚本**；
 2. 按**版本从高到低**各跑一次 `-e 'process.exit(0)'` 冒烟（崩是偶发的，给 3 次机会）；
 3. 第一个真能起来的就用 —— **本机装到 26 就用 26，退其次 24、最后 22**，两种机器都不用改命令；
 4. 开关（`--expose-internals` / `--experimental-sqlite` / `compat-loader`）按**运行时能力探测**，绝不塞它不认的参数（v24 原生有 `node:sqlite`、原生 zstd，就不再加垫片参数）。
@@ -520,6 +521,20 @@ MIT License，见 [LICENSE](LICENSE)。
 ---
 
 ## 更新记录
+
+### 2026-10-09 — 跟进官方 0.2.1-alpha.1 / alpha.2（大重构迁移：settings 垫片重写 + 原生 addon 纯 JS 复刻 + 6 个插件 codec 适配；本机已切到 0.2.1-alpha.2 运行）
+
+- **背景**：官方最新线是 `0.2.1-alpha.1`（2026-10-03）。它把 `dsh-settings` 从 `SettingsProvider` 重写为 `SettingsForms`（configEditor 的 Config schema 自动分区），**删掉**了 `settingsNamespace`/`installSettingsSection`/`settings.register`/`settings.get`；
+  而本机社区插件（market / hiboard-push / 皮肤 / kb / visual / workstation / scholar…）仍走旧 API —— 0.2.x 上直接**模块加载即 TypeError**。上一轮排查后暂守 0.1.6；本轮把迁移做完，`~/dsh-test` 先跑在 `0.2.1-alpha.1`，随后直装推进到 `0.2.1-alpha.2`（补丁按文件形状自适应，见下）。
+- **settings 兼容垫片（本轮核心）**：新增 `scripts/dsh-settings-compat.mjs`，由 `patchSettingsCompat` 内联进 `dsh-settings` 并补回旧导出。它在 0.2.x 的 `SettingsForms` 上挂一套自包含的「旧命名空间存储」（`register/get/section/installSection/describe/update/replace/mutate/write` + `settingsNamespace`/`installSettingsSection`/`deepEqualJson`），与新的 configEditor 表单**并存**：`describe` 合并新旧分区，写方法按 ns 是否属旧命名空间分发；旧数据落 `settings-legacy.json`。
+- **原生 addon 纯 JS 复刻**：`0.2.1` 起 `dsh-app-boot` 用 C++ addon `node-addon-require-builtin` 取 node 内部模块，鸿蒙无 `openharmony-arm64` 预编译件、也无编译器/CMake → `patchRequireBuiltinAddon` 换成 `--expose-internals` 下的纯 JS 复刻（`require('internal/…')`）。
+- **typert codec 适配**：0.2.x 的 `dsh-typert-loader` 要求 invocation codec 形如 `{mode,typeSymbol,create()}`，而 6 个社区插件（cost-meter / knowledge-base / session-groups / doc-quick / peak-valley / workstation）手写清单仍是 0.1.x 的 `{mode,typeSymbol,schema}`（0.1.6 上会 `AggregateError: 6 typert contributor(s) failed to register`）→ `patchTypertCodecCompat` 就地从 `schema` 补 `create()`，不改插件源码。
+- **锚点自适应（alpha.1 / alpha.2 双形状）**：`patchLoopbackAuth` 兼容 0.2.1 把回环登录 303 跳转从 `"location": "/"` 改成 `"./"`；alpha.2 又给 `authorizeIndex`/`isAuthenticated`/`sessionCookie` 加了 `secure` 参数、并把 `requestAuthority` 改名为 `requestAudience(headers, secure)` —— 补丁改为按文件形状判断、自动决定是否补 `secure`（alpha.1 分支插值后与旧补丁逐字节等价，可重打）。
+- **插件侧**：`plugins/dsh-huawei-local-llm` 适配 0.2.x 的 `PiAiAdapter` —— `Config.providers` 由普通对象改成 dict 集合（`get()` 返回整张字典），两种形状都兼容；解析不出 provider 时显式抛错而非静默崩。
+- **自更新器修复（上轮遗留）**：`scripts/dsh-manual-install.mjs` 的 `satisfies`/`pickVersion` 之前只比主版本，把 `^0.1.6` 当「同主版本即满足」→ 误判/误选 0.2.1，跨 0.1↔0.2 的升级/回滚全失效。现按 npm 语义实现 `^0.x`（锁次版本）/`^0.0.x`（锁补丁版本）。另给 `dsh-update.mjs` 加 `DSH_DIR`、给直装器加 `DSH_NODE_MODULES`，便于隔离探针目录干跑。
+- **运行时候选**：`scripts/node-runtime.sh` 候选池补 hmos-clt 自带 node（`/data/service/hnp/hmos-clt.org/*/node/bin/node`）。本机现选 **hmos-clt v24.18.1**（可用）；hnp v24.13 仍 V8 初始化原生崩，deveco v22.7 兜底（v22 回退本轮也实测能起）。
+- **验证**：`sh scripts/dsh-update.sh patch` 19/19 全命中（返回 `false`=已存在）；web `3080` 起、带 cookie `200`（index 38104B）；社区插件逐个 `import` **全绿**（40 项，仅 2 项本就无 `lib/index.js` 入口的 SKIP）；`node scripts/dsh-runtime-check.mjs` **24/24**。启动仅剩 2 条 `pending`（`workspace-changes` 等 `subprocess`、`ui-deliverables` 等 `workspaceChanges`）—— `subprocess` 依赖原生 pty/koffi，鸿蒙本就禁用，与 0.1.6 时代同形，**非回归**（该轮 19/19、`3080`/`200`、`runtime-check 24/24` 在 **0.2.1-alpha.2** 上复测结果一致）。
+- **回滚**：仍可用锁文件回到 0.1.6（`npm ci --ignore-scripts`）；caret 修好后 `dsh-manual-install.mjs` 的降级路径也恢复可用。
 
 ### 2026-09-26（补一轮）— node 支持口径对齐「最新线」：Node 26.10.0 / LTS 24.21.0，依旧不锁版本
 

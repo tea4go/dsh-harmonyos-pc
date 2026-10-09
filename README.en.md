@@ -318,6 +318,7 @@ Raw data `bench/result.json`, report `bench/result.md`; the benchmark script `be
 | `scripts/dsh-web.sh` | Start/restart the dsh Web service (3080, idempotent liveness probe) |
 | `scripts/dsh-update.mjs` | dsh update checks: `check` / `patch` / `install` / `rollback`; re-applies patches automatically after an upgrade |
 | `scripts/dsh-manual-install.mjs` | Manual installer: recursively resolves the full dependency graph from registry metadata and installs tarballs directly (bypasses npm arborist resolution hang); `install()`/`rollback()` call it automatically, npm as fallback |
+| `scripts/dsh-settings-compat.mjs` | Source of the 0.2.x `settings` compat shim (inlined into `dsh-settings` by `dsh-update.mjs` to restore the legacy namespace API) |
 | `scripts/dsh-update-web.sh` | Settings and update page (3098, embedded HTML) |
 | `scripts/dsh-hm-install.mjs` | One-click install of GitHub-source plugins (bypasses isogit interception) |
 | `scripts/node-runtime.sh` | Shared runtime resolver (sourced by every launcher): probes all local node builds and picks the highest one that actually boots |
@@ -328,8 +329,8 @@ drops that floor to the v22.7 that ships with HarmonyOS tooling), while the Harm
 (code-range reservation `mmap` fails → `Fatal error in , line 0` / `Check failed: 12 == (*__errno_location())`,
 with no upstream switch to disable it), whereas deveco's v22.7 is stable. So no script hardcodes a path any more:
 
-1. enumerate every node it can find (`/data/service/hnp/node.org/node_*/bin/node`, `~/deveco/deveco_tools/node/bin/node`, whatever is on `PATH`, common install dirs) —
-   the hnp entries are matched by `node_*` directory, so **an hnp upgrade to Node 26 is picked up with no script change**;
+1. enumerate every node it can find (`/data/service/hnp/node.org/node_*/bin/node`, `/data/service/hnp/hmos-clt.org/*/node/bin/node`, `~/deveco/deveco_tools/node/bin/node`, whatever is on `PATH`, common install dirs) —
+   those two groups are matched by versioned directory, so **an hnp / hmos-clt upgrade to Node 26 is picked up with no script change**;
 2. smoke-test each one **highest version first** with `-e 'process.exit(0)'` (the crash is flaky, so it gets 3 tries);
 3. take the first that really boots — **26 if the machine has it, then 24, then 22**; neither machine has to change a command;
 4. derive flags (`--expose-internals` / `--experimental-sqlite` / `compat-loader`) from **runtime capability probing**, never passing a flag the runtime would reject (v24 has native `node:sqlite` and native zstd, so no shim flags).
@@ -403,6 +404,20 @@ One exception: `desktop-upstream/` is a **source snapshot** of the official desk
 ---
 
 ## Changelog
+
+### 2026-10-09 — Follow upstream 0.2.1-alpha.1 / alpha.2 (big-refactor migration: rewritten settings shim + pure-JS replacement for a native addon + six plugin codecs adapted; this device now runs 0.2.1-alpha.2)
+
+- **Background**: the latest upstream line is `0.2.1-alpha.1` (released 2026-10-03). It rewrites `dsh-settings` from `SettingsProvider` to `SettingsForms` (auto-partitioned by configEditor's Config schema) and **removes** `settingsNamespace` / `installSettingsSection` / `settings.register` / `settings.get`,
+  while this device's community plugins (market / hiboard-push / skins / kb / visual / workstation / scholar…) still use the legacy API — on 0.2.x they throw a **TypeError at module load**. After the previous round we held at 0.1.6; this round finishes the migration — `~/dsh-test` first ran `0.2.1-alpha.1` and was then moved straight to `0.2.1-alpha.2` (with shape-adaptive anchors, see below).
+- **Settings compat shim (the core of this round)**: new `scripts/dsh-settings-compat.mjs`, inlined into `dsh-settings` by `patchSettingsCompat`, which restores the legacy exports. It attaches a self-contained "legacy namespace store" to 0.2.x's `SettingsForms` (`register/get/section/installSection/describe/update/replace/mutate/write` plus `settingsNamespace` / `installSettingsSection` / `deepEqualJson`) that **coexists** with the new configEditor forms: `describe` merges both partitions, and the write methods dispatch by whether the ns belongs to a legacy namespace; legacy data lands in `settings-legacy.json`.
+- **Pure-JS replacement for a native addon**: as of `0.2.1`, `dsh-app-boot` uses the C++ addon `node-addon-require-builtin` to reach node internals; HarmonyOS ships no `openharmony-arm64` prebuild and has no compiler/CMake, so `patchRequireBuiltinAddon` swaps in a pure-JS replica (`require('internal/…')` under `--expose-internals`).
+- **typert codec adaptation**: 0.2.x's `dsh-typert-loader` wants invocation codecs shaped `{mode,typeSymbol,create()}`, but six community plugins (cost-meter / knowledge-base / session-groups / doc-quick / peak-valley / workstation) still ship 0.1.x's `{mode,typeSymbol,schema}` (on 0.1.6 that is `AggregateError: 6 typert contributor(s) failed to register`) — `patchTypertCodecCompat` adds `create()` from the `schema` in place, without touching plugin sources.
+- **Shape-adaptive anchors (alpha.1 / alpha.2)**: `patchLoopbackAuth` accepts 0.2.1's change of the loopback-login 303 redirect from `"location": "/"` to `"./"`; alpha.2 additionally added a `secure` parameter to `authorizeIndex`/`isAuthenticated`/`sessionCookie` and renamed `requestAuthority` to `requestAudience(headers, secure)`, so the patch now inspects the file shape and injects `secure` only when needed (the alpha.1 branch interpolates byte-for-byte identically to the old patch and stays re-appliable).
+- **Plugin side**: `plugins/dsh-huawei-local-llm` adapts to 0.2.x's `PiAiAdapter` — `Config.providers` changed from a plain object to a dict collection whose `get()` returns the whole dictionary; both shapes are handled, and an unresolvable provider now throws instead of silently breaking.
+- **Self-updater fix (leftover from the previous round)**: `scripts/dsh-manual-install.mjs`'s `satisfies`/`pickVersion` used to compare only the major version, treating `^0.1.6` as satisfied by anything on the same major line — misjudging/mis-picking 0.2.1 and breaking every 0.1↔0.2 upgrade/rollback. It now implements npm semantics for `^0.x` (pins the minor) / `^0.0.x` (pins the patch). `dsh-update.mjs` also gains `DSH_DIR` and the direct installer gains `DSH_NODE_MODULES` so probes can run in an isolated directory.
+- **Runtime candidates**: `scripts/node-runtime.sh`'s pool now includes hmos-clt's bundled node (`/data/service/hnp/hmos-clt.org/*/node/bin/node`). This device settles on **hmos-clt v24.18.1** (usable); hnp v24.13 still dies natively during V8 init, deveco v22.7 is the fallback (the v22 path was verified bootable this round too).
+- **Verification**: `sh scripts/dsh-update.sh patch` hits 19/19 (returning `false` = already applied); web on `3080`, cookie-authenticated `200` (index 38104 B); every community plugin imported individually is **all green** (40 entries; the only 2 SKIPs have no `lib/index.js` entry by design); `node scripts/dsh-runtime-check.mjs` **24/24**. Boot leaves just 2 `pending` rows (`workspace-changes` waiting for `subprocess`, `ui-deliverables` waiting for `workspaceChanges`) — `subprocess` needs native pty/koffi, already disabled on HarmonyOS, same shape as the 0.1.6 era, **not a regression** (re-running on **0.2.1-alpha.2** gave the same 19/19, `3080`/`200` and `runtime-check 24/24`).
+- **Rollback**: the lockfile still returns you to 0.1.6 (`npm ci --ignore-scripts`); with the caret fix, `dsh-manual-install.mjs`'s downgrade path works again too.
 
 ### 2026-09-26 (follow-up) — node support statement aligned with the latest line: Node 26.10.0 / LTS 24.21.0, still not pinned
 

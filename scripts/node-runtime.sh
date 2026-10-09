@@ -76,7 +76,7 @@ node_runtime_hint() {
 }
 
 node_runtime_detect() {
-  # 候选：显式指定 > DSH_NODE_CANDIDATES > 自动扫（hnp 各版本 + PATH + deveco 自带 + 常见路径）
+  # 候选：显式指定 > DSH_NODE_CANDIDATES > 自动扫（hnp node.org / hmos-clt 各版本 + PATH + deveco 自带 + 常见路径）
   _explicit=''
   [ -n "${NODE_BIN:-}" ] && _explicit="$NODE_BIN"
   [ -n "${DSH_NODE_BIN:-}" ] && _explicit="$_explicit $DSH_NODE_BIN"
@@ -84,7 +84,7 @@ node_runtime_detect() {
   if [ -n "${DSH_NODE_CANDIDATES:-}" ]; then
     _pool=$(printf '%s' "$DSH_NODE_CANDIDATES" | tr ':' ' ')
   else
-    for _p in /data/service/hnp/node.org/node_*/bin/node; do
+    for _p in /data/service/hnp/node.org/node_*/bin/node /data/service/hnp/hmos-clt.org/*/node/bin/node; do
       [ -x "$_p" ] && _pool="$_pool $_p"
     done
     _sc=$(command -v node 2>/dev/null || true)
