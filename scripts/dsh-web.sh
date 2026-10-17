@@ -2,7 +2,7 @@
 mkdir -p "$HOME/dsh-diag/reports" 2>/dev/null
 # dsh web 服务:启动/重启 (127.0.0.1:3080)。用法: sh scripts/dsh-web.sh [--print-node]
 # 环境变量可覆盖: NODE_BIN / DSH_NODE_BIN(指定 node) DSH_NODE_CANDIDATES(冒号分隔候选)
-#                 DSH_DIR(dsh 安装目录) PATCH_YML(适配补丁) PORT LOG START_TIMEOUT
+#                 DSH_DIR(dsh 安装目录) PATCH_YML(适配补丁) PORT HOST LOG START_TIMEOUT
 # Node 版本：**不锁定版本**。脚本自动探测本机可用的 node（hnp 自带 v24 / deveco 自带 v22 / PATH 里的），
 #   按版本从高到低试，先跑一个 `-e` 冒烟（鸿蒙上 node v24 有 V8 code-range 偶发原生崩），
 #   选定后起服务；起不来就自动换下一个候选 —— 用户**不需要为了跑 dsh 去降 node 版本**。
@@ -13,6 +13,7 @@ DIR="${DSH_DIR:-$HOME/dsh-test}"
 . "$SCRIPT_DIR/node-runtime.sh"
 PATCH="${PATCH_YML:-$SCRIPT_DIR/../harmony.patch.yml}"
 PORT="${PORT:-3080}"
+HOST="${HOST:-127.0.0.1}"
 LOG="${LOG:-$HOME/dsh-web.log}"
 PIDF="$HOME/dsh-web.pid"
 START_TIMEOUT="${START_TIMEOUT:-30}"     # 每个候选运行时的健康检查窗口（秒）
@@ -20,7 +21,7 @@ PRINT_ONLY=0
 for a in "$@"; do
   case "$a" in
     --print-node|--print-runtime) PRINT_ONLY=1 ;;
-    -h|--help) echo "用法: sh scripts/dsh-web.sh [--print-node]"; echo "  环境变量: NODE_BIN/DSH_NODE_BIN(指定 node) DSH_NODE_CANDIDATES(冒号分隔候选)"; echo "            DSH_DIR PATCH_YML PORT LOG START_TIMEOUT"; exit 0 ;;
+    -h|--help) echo "用法: sh scripts/dsh-web.sh [--print-node]"; echo "  环境变量: NODE_BIN/DSH_NODE_BIN(指定 node) DSH_NODE_CANDIDATES(冒号分隔候选)"; echo "            DSH_DIR PATCH_YML PORT HOST LOG START_TIMEOUT"; exit 0 ;;
   esac
 done
 
@@ -92,7 +93,7 @@ for _bin in $OK_BINS; do
   nohup "$_bin" $_flags \
     --report-on-fatalerror --report-uncaught-exception --report-directory="$HOME/dsh-diag/reports" \
     node_modules/@deepseek-ai/dsh/lib/bin.js \
-    --profile web --patch "$PATCH" --no-open >> "$LOG" 2>&1 &
+    --profile web --patch "$PATCH" --host "$HOST" --no-open >> "$LOG" 2>&1 &
   _pid=$!
   echo "$_pid" > "$PIDF"
 
