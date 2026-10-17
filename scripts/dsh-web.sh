@@ -71,15 +71,56 @@ clear_stale_locks
 MC_DIR="$HOME/.dsh/market-catalog"
 MC_PORT=3988
 MC_LOG="$MC_DIR/server.log"
+MC_FETCH_LOG="$MC_DIR/fetch.log"
+MC_URL="${MC_URL:-https://awesome-dsh-plugin.com/plugins.json}"
 mkdir -p "$MC_DIR"
+
+mc_json_ok() {
+  "$NODE" -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$1" 2>/dev/null
+}
+_mc_size() { [ -f "$1" ] && wc -c < "$1" | tr -d ' \t' || echo 0; }
+
+# 目录约 6.8MB、本机下行 ~40KB/s：`curl --max-time 25` 必然截断，而 curl 的返回码**仍是 0**
+# → 直接 mv 会落地一个非法 JSON，市场静默失效。改为断点续传补齐 + JSON 校验通过才替换；
+# .tmp 跨启动保留，续传进度不丢。本地已有合法目录则跳过（否则每次启动都要白等几分钟）。
+mc_fetch() {
+  _tmp="$MC_DIR/plugins.json.tmp"
+  _try=0
+  while [ "$_try" -lt 10 ]; do
+    _before=$(_mc_size "$_tmp")
+    curl -sS -L -C - --max-time 120 -o "$_tmp" "$MC_URL" >/dev/null 2>&1 || true
+    _after=$(_mc_size "$_tmp")
+    if [ "$_after" -gt 0 ] && mc_json_ok "$_tmp"; then
+      mv "$_tmp" "$MC_DIR/plugins.json" && echo "market-catalog: 已更新 ($_after 字节)"
+      return 0
+    fi
+    [ "$_after" -le "$_before" ] && break   # 无进展：网络断或服务端不支持 Range
+    _try=$((_try + 1))
+  done
+  echo "market-catalog: 拉取未完成，保留旧目录（市场暂用旧数据）"
+  return 1
+}
+
 if command -v curl >/dev/null 2>&1; then
-  curl -s --max-time 25 -o "$MC_DIR/plugins.json.tmp" https://awesome-dsh-plugin.com/plugins.json \
-    && mv "$MC_DIR/plugins.json.tmp" "$MC_DIR/plugins.json" 2>/dev/null
-  rm -f "$MC_DIR/plugins.json.tmp"
+  if mc_json_ok "$MC_DIR/plugins.json"; then
+    echo "market-catalog: 本地目录已存在且合法，跳过下载"
+  else
+    mc_fetch >> "$MC_FETCH_LOG" 2>&1 &   # 后台续传，不拖慢服务启动
+  fi
 fi
 if ! curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$MC_PORT/plugins.json"; then
-  pkill -f "http.server $MC_PORT" 2>/dev/null
-  nohup python3 -m http.server "$MC_PORT" --bind 127.0.0.1 --directory "$MC_DIR" > "$MC_LOG" 2>&1 &
+  # 鸿蒙上没有 python3（原来的 `python3 -m http.server` 从未起来过，server.log 里只有
+  # `exec python3: No such file or directory`），改用已探测到的 node 起个最小静态服务。
+  pkill -f "dsh/market-catalog $MC_PORT" 2>/dev/null
+  nohup "$NODE" -e '
+const http = require("http"), fs = require("fs"), path = require("path");
+const dir = path.resolve(process.argv[1]), port = Number(process.argv[2]);
+http.createServer((req, res) => {
+  const file = path.join(dir, decodeURIComponent(new URL(req.url, "http://127.0.0.1").pathname));
+  if (!file.startsWith(dir + path.sep)) { res.writeHead(403).end(); return; }
+  fs.createReadStream(file).on("error", () => res.writeHead(404).end()).pipe(res);
+}).listen(port, "127.0.0.1");
+' "$MC_DIR" "$MC_PORT" > "$MC_LOG" 2>&1 &
 fi
 export DSHM_REGISTRY_URL="http://127.0.0.1:$MC_PORT/plugins.json"
 
