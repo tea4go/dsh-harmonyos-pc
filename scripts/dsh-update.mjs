@@ -304,7 +304,7 @@ function patchFsLocal() {
 }
 function patchVision() {
   const txt = readFileSafe(VISUAL_FILE);
-  if (!txt) throw new Error('dsh-visual-plugin 入口不存在，需手动处理: ' + VISUAL_FILE);
+  if (!txt) return { changed: false, skipped: 'dsh-visual-plugin 未安装' };
   if (txt.includes(MARK)) return { changed: false };
   let patched = txt;
   // 1) 面板未配置时的回退常量（紧跟 DEFAULT_API_KEY_ENV 之后）。
@@ -350,7 +350,7 @@ function patchVision() {
       '\t\t\tapiKey: fallbackKey.value\n' +
       '\t\t};');
   } else if (!patched.includes('const deepseek = settings.get(DEEPSEEK_PROVIDER_NS)')) {
-    throw new Error('vision 补丁锚点缺失(resolvedFacts)，需手动处理: ' + VISUAL_FILE);
+    return { changed: false, skipped: 'vision 锚点不匹配(插件版本已变)' };
   }
   // 3) describeImage：空 content(PROTOCOL)重试一次，仍空则降级为明确提示而非硬抛。
   const descAnchor = '\tconst result = await callChatCompletions(completionsUrl(baseUrl), apiKey, model, messages, signal);\n' +
@@ -374,7 +374,7 @@ function patchVision() {
       '\tif (lastError !== void 0) return { description: "（视觉模型未返回内容，请重试或换个问法）" };\n' +
       '\treturn { description: "（视觉模型未返回内容）" };');
   } else if (!patched.includes('const describeOf = (result) =>')) {
-    throw new Error('vision 补丁锚点缺失(describeImage)，需手动处理: ' + VISUAL_FILE);
+    return { changed: false, skipped: 'vision 锚点不匹配(describeImage)' };
   }
   writeFileSync(VISUAL_FILE, patched);
   return { changed: true };
@@ -747,9 +747,11 @@ function patchAll() {
   const r16 = patchMessagesSkipNonText();
   const r17 = patchRequireBuiltinAddon();
   const r18 = patchTypertCodecCompat();
-  for (const f of [CRED_FILE, SESS_FILE, PERM_FILE, ATTACH_FILE, VISUAL_FILE, CORDIS_LOADER_FILE, SETTINGS_FILE, CONN_FILE, BIN_FILE, RUNNER_FILE, WORKER_CJS_FILE, SESSION_FORMAT_FILE, SUBAGENT_FILE, MESSAGES_FILE]) {
+  for (const f of [CRED_FILE, SESS_FILE, PERM_FILE, ATTACH_FILE, CORDIS_LOADER_FILE, SETTINGS_FILE, CONN_FILE, BIN_FILE, RUNNER_FILE, WORKER_CJS_FILE, SESSION_FORMAT_FILE, SUBAGENT_FILE, MESSAGES_FILE]) {
     if (!readFileSafe(f).includes(MARK)) throw new Error('补丁校验失败(标记缺失): ' + f);
   }
+  // dsh-visual-plugin 是第三方可选插件：未安装或版本锚点已变时跳过，不阻断核心补丁。
+  if (readFileSafe(VISUAL_FILE) && !readFileSafe(VISUAL_FILE).includes(MARK)) throw new Error('补丁校验失败(标记缺失): ' + VISUAL_FILE);
   if (readFileSafe(TYPERT_LOADER_FILE) && !readFileSafe(TYPERT_LOADER_FILE).includes(MARK + ': typert codec')) {
     throw new Error('补丁校验失败(标记缺失): ' + TYPERT_LOADER_FILE);
   }
