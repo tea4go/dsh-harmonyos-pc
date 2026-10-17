@@ -74,14 +74,16 @@ export function hasSearchedMarker(messages) {
   return textOfMessages(messages).includes(SEARCHED_MARKER);
 }
 
-/** 找到最后一个 user 角色的消息索引；guard 消息（plugin source）不算用户新问题。 */
+/** 找到最后一个 user 角色的消息索引；guard 消息（插件 producer 的 source）不算用户新问题。 */
 export function lastUserIndex(messages) {
   const list = Array.isArray(messages) ? messages : [];
   for (let i = list.length - 1; i >= 0; i--) {
     const message = list[i];
     if (message?.role !== "user") continue;
     const source = message?.source ?? message?.pluginSource;
-    if (source?.kind === "plugin") continue; // 插件注入的守卫不是新问题
+    // v4 里第三方插件的 source kind 是 `plugin:<name>`（含历史会话迁移过来的行），
+    // 旧的裸 "plugin" 只在 v3 出现过，一并认。
+    if (typeof source?.kind === "string" && (source.kind === "plugin" || source.kind.startsWith("plugin:"))) continue;
     return i;
   }
   return -1;

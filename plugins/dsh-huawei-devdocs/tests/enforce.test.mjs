@@ -50,7 +50,7 @@ test("消息文本提取与最后用户消息", () => {
 test("插件守卫消息不算新用户问题", () => {
   const messages = [
     { role: "user", content: "问题" },
-    { role: "user", content: "守卫", source: { kind: "plugin", plugin: "huawei-devdocs" } },
+    { role: "user", content: "守卫", source: { kind: "plugin:huawei-devdocs" } },
   ];
   assert.equal(lastUserIndex(messages), 0);
 });

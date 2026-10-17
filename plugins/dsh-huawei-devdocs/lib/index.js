@@ -367,7 +367,10 @@ export function apply(ctx, config = {}) {
   const createGuardMessage = (text) =>
     createUserMessage({
       content: [{ type: "text", text }],
-      source: { kind: "plugin", plugin: "huawei-devdocs" }, // 无 form：released v0 插件表单封闭，"guard" 自定义表单会被官方 v0→v1 冻结校验拒绝
+      // kind 必须是 producer 自己的：session format v4 硬拒绝兜底的 "plugin"
+      // （报 "format v4 message requires a producer-owned source kind"）。
+      // 无 form：released v0 插件表单封闭，"guard" 自定义表单会被官方 v0→v1 冻结校验拒绝。
+      source: { kind: "plugin:huawei-devdocs" },
     });
 
   // 全局拦截点：agent/pre-step → 检测鸿蒙开发意图 + 检索缺失 → 注入强制守卫。

@@ -106,7 +106,11 @@ export function apply(ctx) {
     scanToolResult,
     createGuardMessage: (text) => createUserMessage({
       content: [{ type: "text", text }],
-      source: { kind: "plugin", plugin: "prompt-antivirus" }, // 无 form：released v0 插件表单封闭，"guard" 自定义表单会被官方 v0→v1 冻结校验拒绝
+      // kind 必须是 producer 自己的（session format v4 硬拒绝兜底的 "plugin"，
+      // 报 "format v4 message requires a producer-owned source kind"）。第三方
+      // 插件的规范值就是 dsh 迁移函数 producerKind() 给的 `plugin:<name>`。
+      // 无 form：released v0 插件表单封闭，"guard" 自定义表单会被官方 v0→v1 冻结校验拒绝。
+      source: { kind: "plugin:prompt-antivirus" },
     }),
   });
 
