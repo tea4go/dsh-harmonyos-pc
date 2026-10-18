@@ -39,6 +39,11 @@ const SETTINGS_FILE = join(DSH_DIR, 'node_modules', '@deepseek-ai', 'dsh-setting
 // dsh web 认证：0.1.2-alpha.2 每次进程启动都换新 launch token，本机新标签页/收藏夹的裸地址
 // http://127.0.0.1:3080 永远 401「authentication required」。回环地址改为免 token 自动签发 cookie。
 const CONN_FILE = join(DSH_DIR, 'node_modules', '@deepseek-ai', 'dsh-client-connection', 'lib', 'index.js');
+// LAN(非 loopback)页面配 settings：限制在 dsh-client-connection 的**客户端**文件里(与上面服务端
+// index.js 不同文件)——按浏览器地址栏 hostname 判定 isLoopback，非 loopback 时 dsh-client-ui-settings
+// 把持久化降级为 memory，设置面板即报「settings are unavailable in this browser」，LAN 下配不了 API key。
+// 服务端无任何 loopback 校验(全仓非 client 的 .js 无匹配)，故只需放开该客户端判定。
+const CONN_CLIENT_FILE = join(DSH_DIR, 'node_modules', '@deepseek-ai', 'dsh-client-connection', 'lib', 'client.js');
 // dsh-visual-plugin（第三方，github.com/jyh20030112/dsh-visual-plugin）以源码形式落在 profile 树，
 // 经 dsh-hm-install.mjs 铺进 plugins-src 并软链到 node_modules；运行时入口是 lib/index.js。
 const VISUAL_FILE = join(HOME, '.dsh', 'profiles', 'web', 'plugins-src', 'dsh-visual-plugin', 'lib', 'index.js');
@@ -522,6 +527,23 @@ function patchLoopbackAuth() {
   writeFileSync(CONN_FILE, patched);
   return { changed: true };
 }
+// LAN 页面改 settings：客户端按浏览器 hostname 判 isLoopback，非 loopback → 持久化降级为 memory →
+// 设置面板「settings are unavailable in this browser」，LAN 下无法配 API key。服务端不校验 loopback，
+// 故只需把该判定放开。代价：失去「只有 Host 本机浏览器能改配置」的客户端保护(LAN 部署本身有 token 保护)。
+function patchLanSettings() {
+  const txt = readFileSafe(CONN_CLIENT_FILE);
+  if (!txt) throw new Error('dsh-client-connection(client) 文件不存在，需手动处理: ' + CONN_CLIENT_FILE);
+  if (txt.includes('HarmonyOS patch: LAN')) return { changed: false };
+  const anchor = 'isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),';
+  const count = txt.split(anchor).length - 1;
+  if (count !== 1) throw new Error('client-connection(client) 补丁锚点缺失/重复(count=' + count + ')，需手动处理: ' + CONN_CLIENT_FILE);
+  const replacement =
+    '/* HarmonyOS patch: LAN 页面也能配置 settings——服务端不校验 loopback，只有客户端按地址栏 hostname\n' +
+    '\t\t\t\t * 降级持久化；放开后失去「仅 Host 本机浏览器可改配置」的保护(LAN 部署本身有 token 保护)。 */\n' +
+    '\t\t\t\tisLoopback: true,';
+  writeFileSync(CONN_CLIENT_FILE, txt.replace(anchor, replacement));
+  return { changed: true };
+}
 // 0.2.1 起 bin.js 不再 import node:url，"改 import 行" 的旧锚点会静默失配：
 // 垫片内的 try/catch 会吞掉 ReferenceError → isMainEntry 恒 false → 入口静默退出码 0。
 // 改为自包含的动态 import 判等垫片；先剥掉旧块再统一插入，保证幂等/可重打。
@@ -747,7 +769,8 @@ function patchAll() {
   const r16 = patchMessagesSkipNonText();
   const r17 = patchRequireBuiltinAddon();
   const r18 = patchTypertCodecCompat();
-  for (const f of [CRED_FILE, SESS_FILE, PERM_FILE, ATTACH_FILE, CORDIS_LOADER_FILE, SETTINGS_FILE, CONN_FILE, BIN_FILE, RUNNER_FILE, WORKER_CJS_FILE, SESSION_FORMAT_FILE, SUBAGENT_FILE, MESSAGES_FILE]) {
+  const r19 = patchLanSettings();
+  for (const f of [CRED_FILE, SESS_FILE, PERM_FILE, ATTACH_FILE, CORDIS_LOADER_FILE, SETTINGS_FILE, CONN_FILE, CONN_CLIENT_FILE, BIN_FILE, RUNNER_FILE, WORKER_CJS_FILE, SESSION_FORMAT_FILE, SUBAGENT_FILE, MESSAGES_FILE]) {
     if (!readFileSafe(f).includes(MARK)) throw new Error('补丁校验失败(标记缺失): ' + f);
   }
   // dsh-visual-plugin 是第三方可选插件：未安装或版本锚点已变时跳过，不阻断核心补丁。
@@ -761,7 +784,7 @@ function patchAll() {
   if (!readFileSafe(FS_LOCAL_FILE).includes('HarmonyOS /storage mounts reject hard links')) {
     throw new Error('补丁校验失败(标记缺失): ' + FS_LOCAL_FILE);
   }
-  return { loaders: l.changed, credential: r1.changed, session: r2.changed, permission: r3.changed, attachment: r4.changed, vision: r5.changed, cordisLoader: r6.changed, settingsCompat: r7.changed, loopbackAuth: r8.changed, fsLocal: r9.changed, importMetaMain: r10.changed, workerZlib: r11.changed, sessionVerify: r12.changed, sessionFormat: r13.changed, migrationPublish: r14.changed, subagentIdentity: r15.changed, messagesSkipNonText: r16.changed, requireBuiltinAddon: r17.changed, typertCodec: r18.changed };
+  return { loaders: l.changed, credential: r1.changed, session: r2.changed, permission: r3.changed, attachment: r4.changed, vision: r5.changed, cordisLoader: r6.changed, settingsCompat: r7.changed, loopbackAuth: r8.changed, fsLocal: r9.changed, importMetaMain: r10.changed, workerZlib: r11.changed, sessionVerify: r12.changed, sessionFormat: r13.changed, migrationPublish: r14.changed, subagentIdentity: r15.changed, messagesSkipNonText: r16.changed, requireBuiltinAddon: r17.changed, typertCodec: r18.changed, lanSettings: r19.changed };
 }
 
 // compat-loader.mjs（node v22 鸿蒙运行时 polyfill）依赖的纯 JS 包。重装核心包时它们不在依赖树里
@@ -881,7 +904,7 @@ export async function install() {
   log('安装完成 → ' + target);
   writeFileSync(PREV, before);
   const p = patchAll();
-  log('补丁: credential=' + (p.credential ? '重打' : '已存在') + ', session=' + (p.session ? '重打' : '已存在') + ', permission=' + (p.permission ? '重打' : '已存在') + ', attachment=' + (p.attachment ? '重打' : '已存在') + ', vision=' + (p.vision ? '重打' : '已存在') + ', cordisLoader=' + (p.cordisLoader ? '重打' : '已存在') + ', settingsCompat=' + (p.settingsCompat ? '重打' : '已存在') + ', loopbackAuth=' + (p.loopbackAuth ? '重打' : '已存在') + ', fsLocal=' + (p.fsLocal ? '重打' : '已存在') + ', importMetaMain=' + (p.importMetaMain ? '重打' : '已存在') + ', workerZlib=' + (p.workerZlib ? '重打' : '已存在') + ', sessionVerify=' + (p.sessionVerify ? '重打' : '已存在') + ', sessionFormat=' + (p.sessionFormat ? '重打' : '已存在'));
+  log('补丁: credential=' + (p.credential ? '重打' : '已存在') + ', session=' + (p.session ? '重打' : '已存在') + ', permission=' + (p.permission ? '重打' : '已存在') + ', attachment=' + (p.attachment ? '重打' : '已存在') + ', vision=' + (p.vision ? '重打' : '已存在') + ', cordisLoader=' + (p.cordisLoader ? '重打' : '已存在') + ', settingsCompat=' + (p.settingsCompat ? '重打' : '已存在') + ', loopbackAuth=' + (p.loopbackAuth ? '重打' : '已存在') + ', fsLocal=' + (p.fsLocal ? '重打' : '已存在') + ', importMetaMain=' + (p.importMetaMain ? '重打' : '已存在') + ', workerZlib=' + (p.workerZlib ? '重打' : '已存在') + ', sessionVerify=' + (p.sessionVerify ? '重打' : '已存在') + ', sessionFormat=' + (p.sessionFormat ? '重打' : '已存在') + ', lanSettings=' + (p.lanSettings ? '重打' : '已存在'));
   const killed = stopDsh();
   if (killed > 0) log('已停旧 dsh 进程 ' + killed + ' 个');
   restartDsh();
